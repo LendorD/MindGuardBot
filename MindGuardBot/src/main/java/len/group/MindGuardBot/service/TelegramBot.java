@@ -1,13 +1,18 @@
 package len.group.MindGuardBot.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import len.group.MindGuardBot.config.BotConfig;
 import len.group.MindGuardBot.dao.TaskRepository;
 import len.group.MindGuardBot.dao.UserRepository;
+import len.group.MindGuardBot.helper.ScheduleSession;
 import len.group.MindGuardBot.models.Task;
 import len.group.MindGuardBot.models.User;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
 import org.hibernate.Hibernate;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
@@ -23,7 +28,10 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
+import java.io.IOException;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 
 @Slf4j
@@ -41,9 +49,13 @@ public class TelegramBot extends TelegramLongPollingBot {
 
     private final BotConfig botConfig;
 
-
     private final UserRepository userRepository;
     private final TaskRepository taskRepository;
+
+    private final Map<Long, ScheduleSession> userSessions = new HashMap<>();
+
+    @Value("${together.api.key}")
+    private String togetherApiKey;
 
     @Autowired
     public TelegramBot(BotConfig botConfig, UserRepository userRepository, TaskRepository taskRepository1) {
@@ -64,10 +76,39 @@ public class TelegramBot extends TelegramLongPollingBot {
             } else if (text.equals("/reg")) {
                 regUser(chatId, update.getMessage().getChat().getFirstName());
             } else if (text.equals("/addtask")) {
-//                startTaskCreation(chatId);  // 🔹 Запуск интерактивного режима
+                startTaskCreation(chatId);  // 🔹 Интерактивный режим задач
             } else if (text.equals("/mytasks")) {
                 handleMyTasks(chatId);
+            } else if (text.equals("/gen_schedule")) {
+                ScheduleSession session = new ScheduleSession();
+                session.setStep(ScheduleSession.ScheduleStep.WAITING_FOR_SCHEDULE);
+                userSessions.put(chatId, session);
+                sendMessage(chatId, "📅 Пришли своё расписание занятий (в любом виде):");
+                return;
             } else {
+                // интерактивная генерация расписания
+                if (userSessions.containsKey(chatId)) {
+                    ScheduleSession session = userSessions.get(chatId);
+                    switch (session.getStep()) {
+                        case WAITING_FOR_SCHEDULE -> {
+                            session.setRawSchedule(text);
+                            session.setStep(ScheduleSession.ScheduleStep.WAITING_FOR_TASKS);
+                            sendMessage(chatId, "✅ Расписание получено!\n\nТеперь пришли список задач и сколько времени ты хочешь потратить на каждую (например:\n- Домашка по ТАиФЯ — 3ч\n- Курсовая — 5ч)");
+                            return;
+                        }
+                        case WAITING_FOR_TASKS -> {
+                            session.setRawTasks(text);
+                            sendMessage(chatId, "🔄 Генерирую расписание с помощью нейросети...");
+
+                            String finalSchedule = callAiScheduler(session.getRawSchedule(), session.getRawTasks());
+
+                            sendMessage(chatId, "🧠 Вот твоё сгенерированное расписание:\n\n" + finalSchedule);
+                            userSessions.remove(chatId);
+                            return;
+                        }
+                    }
+                }
+                // интерактивная запись задачи
                 TaskState state = userStates.get(chatId);
                 if (state != null) {
                     switch (state) {
@@ -107,11 +148,140 @@ public class TelegramBot extends TelegramLongPollingBot {
                 handleMyTasks(chatId);
             } else if (callbackData.startsWith("EDIT_BUTTON_")) {
                 String taskId = callbackData.split("_")[2];
-                // Логика редактирования задачи
             } else if (callbackData.startsWith("DATE_")) {
-                processTaskDate(chatId, callbackData);  // 🔹 Обработка выбора даты
+                processTaskDate(chatId, callbackData);
             }
         }
+    }
+
+    public String callAiScheduler(String schedule, String tasks) {
+        String prompt = String.format("""
+        Составь расписание задач по следующей информации.
+        
+        Вот расписание занятий:
+        %s
+
+        Вот список задач с указанием времени:
+        %s
+
+        Составь оптимальное расписание на неделю. Не переписывай пары, а только дополняй расписание задачами.
+        Ответь красиво и понятно, например:
+        Понедельник:
+        - 18:00–20:00: Курсовая
+        
+        Вторник:
+        - 17:00–19:00: Подготовка к ТАиФЯ
+        """, schedule, tasks);
+
+        try {
+            OkHttpClient client = new OkHttpClient();
+
+            MediaType mediaType = MediaType.get("application/json");
+            String json = new ObjectMapper().writeValueAsString(Map.of(
+                    "model", "meta-llama/Llama-3-70b-chat-hf",
+                    "max_tokens", 500,
+                    "temperature", 0.7,
+                    "messages", List.of(
+                            Map.of("role", "user", "content", prompt)
+                    )
+            ));
+
+            Request request = new Request.Builder()
+                    .url("https://api.together.xyz/v1/chat/completions")
+                    .post(RequestBody.create(mediaType, json))
+                    .addHeader("Authorization", "Bearer " + togetherApiKey)  // или подставь напрямую
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful()) throw new IOException("Ошибка запроса: " + response);
+
+                String body = response.body().string();
+                JsonNode root = new ObjectMapper().readTree(body);
+                return root.get("choices").get(0).get("message").get("content").asText();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "❌ Произошла ошибка при генерации расписания.";
+        }
+    }
+
+
+
+    private void startTaskCreation(Long chatId) {
+        userStates.put(chatId, TaskState.AWAITING_DESCRIPTION);
+        sendMessage(chatId, "📝 Введите описание задачи:");
+    }
+
+    private void processTaskDescription(Long chatId, String description) {
+        userStates.put(chatId, TaskState.AWAITING_DATE_SELECTION);
+
+        Task task = new Task();
+        task.setDescription(description);
+        pendingTasks.put(chatId, task);
+
+        InlineKeyboardMarkup markup = new InlineKeyboardMarkup();
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+
+        rows.add(Collections.singletonList(createButton("📅 Сегодня", "DATE_TODAY")));
+        rows.add(Collections.singletonList(createButton("📆 Завтра", "DATE_TOMORROW")));
+        rows.add(Collections.singletonList(createButton("🗓 Выбрать дату", "DATE_CUSTOM")));
+
+        markup.setKeyboard(rows);
+        sendMessage(chatId, "Выберите дату выполнения задачи:", markup);
+    }
+
+    private InlineKeyboardButton createButton(String text, String callbackData) {
+        InlineKeyboardButton button = new InlineKeyboardButton();
+        button.setText(text);
+        button.setCallbackData(callbackData);
+        return button;
+    }
+
+    private void processCustomDate(Long chatId, String text) {
+        try {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+            LocalDateTime deadline = LocalDateTime.parse(text, formatter);
+
+            Task task = pendingTasks.get(chatId);
+            if (task != null) {
+                saveTask(chatId, task, deadline);
+            }
+        } catch (DateTimeParseException e) {
+            sendMessage(chatId, "❌ Ошибка! Введите дату в формате `DD.MM.YYYY HH:MM`.");
+        }
+    }
+
+    private void processTaskDate(Long chatId, String callbackData) {
+        Task task = pendingTasks.get(chatId);
+        if (task == null) return;
+
+        LocalDateTime deadline;
+        if (callbackData.equals("DATE_TODAY")) {
+            deadline = LocalDateTime.now().withHour(18).withMinute(0);
+        } else if (callbackData.equals("DATE_TOMORROW")) {
+            deadline = LocalDateTime.now().plusDays(1).withHour(18).withMinute(0);
+        } else {
+            userStates.put(chatId, TaskState.AWAITING_CUSTOM_DATE);
+            sendMessage(chatId, "Введите дату в формате `DD.MM.YYYY HH:MM`:");
+            return;
+        }
+
+        saveTask(chatId, task, deadline);
+    }
+
+    private void saveTask(Long chatId, Task task, LocalDateTime deadline) {
+        task.setDeadline(deadline);
+        task.setUser(userRepository.findByChatIdWithTasks(chatId));
+        task.setCompleted(false);
+        taskRepository.save(task);
+
+        pendingTasks.remove(chatId);
+        userStates.remove(chatId);
+
+        sendMessage(chatId, "✅ Задача добавлена: " + task.getDescription() +
+                "\n📅 Дедлайн: " + deadline.format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")));
     }
 
 
@@ -161,37 +331,35 @@ public class TelegramBot extends TelegramLongPollingBot {
         }
     }
 
-    @Transactional
-    public void handleAddTask(Long chatId, String text) {
-        try {
-            // Формат: /addtask Описание задачи /завтра 18:00
-            String[] parts = text.split("/завтра");
-            log.info(parts[0]);
-            String description = parts[0].replace("/addtask", "").trim();
-            LocalDateTime deadline = LocalDateTime.now()
-                    .plusDays(1)
-                    .withHour(18)
-                    .withMinute(0)
-                    .withSecond(0);
+//    @Transactional
+//    public void handleAddTask(Long chatId, String text) {
+//        try {
+//            // Формат: /addtask Описание задачи /завтра 18:00
+//            String[] parts = text.split("/завтра");
+//            log.info(parts[0]);
+//            String description = parts[0].replace("/addtask", "").trim();
+//            LocalDateTime deadline = LocalDateTime.now()
+//                    .plusDays(1)
+//                    .withHour(18)
+//                    .withMinute(0)
+//                    .withSecond(0);
+//
+//            User user = userRepository.findByChatIdWithTasks(chatId);
+//            Task task = new Task();
+//            task.setDescription(description);
+//            task.setDeadline(deadline);
+//            task.setUser(user);
+//            task.setCompleted(false);
+//            System.out.println();
+//            taskRepository.save(task);
+//
+//            sendMessage(chatId, "✅ Задача добавлена: " + description);
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//            sendMessage(chatId, "❌ Ошибка формата или регистрации( /reg ). Используй: /addtask Описание /завтра 18:00");
+//        }
+//    }
 
-            User user = userRepository.findByChatIdWithTasks(chatId);
-            Task task = new Task();
-            task.setDescription(description);
-            task.setDeadline(deadline);
-            task.setUser(user);
-            task.setCompleted(false);
-            System.out.println();
-            taskRepository.save(task);
-
-            sendMessage(chatId, "✅ Задача добавлена: " + description);
-        } catch (Exception e) {
-            e.printStackTrace();
-            sendMessage(chatId, "❌ Ошибка формата или регистрации( /reg ). Используй: /addtask Описание /завтра 18:00");
-        }
-    }
-
-
-    
 
     private void handleMyTasks(Long chatId) {
         User user = userRepository.findByChatId(chatId);
